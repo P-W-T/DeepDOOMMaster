@@ -64,7 +64,7 @@ def advantage_GAE(observations, actions, rewards, model_Vn, final, discount, lam
     return discount_rewards, new_observations, new_actions, new_advantages
  
 
-def loss_fn(model, model_old, observation_tensor, action_tensor, weight_tensor, beta, epsilon):
+def loss_fn_policy(model, model_old, observation_tensor, action_tensor, weight_tensor, beta, epsilon):
     """
     Calculate the loss for a policy network with entropy regularization.
 
@@ -96,7 +96,78 @@ def loss_fn(model, model_old, observation_tensor, action_tensor, weight_tensor, 
     # The total loss is the sum of policy loss and entropy regularization
     return policy_loss + entropy_regularization 
 
-def sync_agents(model_policy, model_Vn, envs, max_length, lam, discount, last_observations, lengths_final, rewards_final, temp_lengths, temp_rewards, games, flattened_observation_space, flattened_action_space, device):
+
+def loss_fn_Vn(model, model_old, observation_tensor, discount_reward_tensor, epsilon, only_clipping=True):
+    """
+    Calculate the clipped loss for a value network.
+
+    Parameters:
+    model (torch.nn.Module): The policy model that outputs action probabilities.
+    model_old (torch.nn.Module): The old policy model that outputs action probabilities (the model with which the data was generated).
+    observation_tensor (torch.Tensor): Tensor of observations.
+    discount_reward_tensor (torch.Tensor): Tensor of discounted rewards.
+    epsilon (float/tuple): Clipping parameter to clip the policy loss in ppo.
+    only_clipping (bool): if True return the clipped loss (else the max of the clipped and unclipped loss)
+
+    Returns:
+    torch.Tensor: The calculated loss value.
+    """
+    
+    # Get the value estimates
+    Vn = torch.squeeze(model(observation_tensor))
+    with torch.no_grad():
+        Vn_old = torch.squeeze(model_old(observation_tensor))
+    
+    # Clipped values
+    if isinstance(epsilon, tuple) or isinstance(epsilon, list):
+        epsilon1 = epsilon[0]
+        epsilon2 = epsilon[1]
+    else:
+        epsilon1 = epsilon
+        epsilon2 = epsilon
+    
+    Vn_clipped = torch.clamp(Vn, min=(Vn_old-epsilon1), max=(Vn_old+epsilon2))
+    
+    # only clipping is a modern variant
+    if only_clipping:
+         return nn.functional.mse_loss(Vn_clipped, discount_reward_tensor)
+    
+    # Calculate losses
+    loss_Vn = nn.functional.mse_loss(Vn, discount_reward_tensor, reduction='none')
+    loss_Vn_clipped = nn.functional.mse_loss(Vn_clipped, discount_reward_tensor, reduction='none')
+    
+    overall_loss = torch.maximum(loss_Vn, loss_Vn_clipped).mean()
+    return overall_loss
+
+
+class RewardScale:
+    def __init__ (self, discount, max_length=100000):
+        self.discount = discount        
+        self.R = np.zeros(max_length)
+        self.index = 0
+        self.max_length = max_length
+        self.length = 0
+    
+    def __call__(self, r):
+        self.R[self.index] = self.discount*self.R[self.index-1] + r
+        
+        if self.index >= self.max_length-1:
+            self.index = 0
+        else:
+            self.index += 1
+        
+        if self.length < self.max_length:
+            self.length += 1
+        
+        if self.length < 2:
+            return r/abs(r)
+        
+        return r/np.std(self.R[:self.length])
+
+
+def sync_agents(model_policy, model_Vn, envs, max_length, lam, discount, last_observations,
+                temp_lengths, temp_rewards, games, flattened_observation_space, flattened_action_space,
+                reward_scale, reward_clipping, device):
     """
     use multiple agents in a reinforcement learning environment and computes rewards and advantages.
 
@@ -108,13 +179,13 @@ def sync_agents(model_policy, model_Vn, envs, max_length, lam, discount, last_ob
     lam (float): Lambda parameter used in GAE calculation.
     discount (float): Discount factor for future rewards.
     last_observations (np.array): Last observed states from the environment.
-    lengths_final (np.array): Array to record the final lengths of each episode.
-    rewards_final (np.array): Array to record the final rewards of each episode.
     temp_lengths (np.array): Temporary array to hold lengths for ongoing episodes.
     temp_rewards (np.array): Temporary array to hold rewards for ongoing episodes.
     games (np.array): Array to record the number of games played per agent per cycle. 
     flattened_observation_space (int): Size of the flattened observation space.
     flattened_action_space (int): Size of the flattened action space.
+    reward_scale (vectorized class instance): Vectorized instance of reward scaling class (RewardScale) or None.
+    reward_clipping (float/tuple): Clip values to enable reward clipping.
     device (str): Device for PyTorch tensors ('cpu' or 'cuda').
 
     Returns:
@@ -123,9 +194,12 @@ def sync_agents(model_policy, model_Vn, envs, max_length, lam, discount, last_ob
     """
     
     # Initialize numpy arrays to store observations, actions, and rewards
-    observation_list = np.full((max_length+1, len(rewards_final), flattened_observation_space), np.nan)
-    action_list = np.full((max_length, len(rewards_final), flattened_action_space), np.nan)
-    reward_list = np.full((max_length, len(rewards_final)), np.nan)
+    observation_list = np.full((max_length+1, len(temp_lengths), flattened_observation_space), np.nan)
+    action_list = np.full((max_length, len(temp_lengths), flattened_action_space), np.nan)
+    reward_list = np.full((max_length, len(temp_lengths)), np.nan)
+    reward_list_base = np.full((max_length, len(temp_lengths)), np.nan)
+    cum_rewards = np.zeros((len(temp_lengths)))
+    cum_lengths = np.zeros((len(temp_lengths)))
     
     # Lists to store rewards, observations, actions, and advantages for training
     discount_rewards_list = []
@@ -145,7 +219,16 @@ def sync_agents(model_policy, model_Vn, envs, max_length, lam, discount, last_ob
         observations, rewards, termination, truncation, infos = envs.step(model_policy.unflatten_action(actions))      
         final = (termination | truncation)
         action_list[step,:,:] = actions
-        reward_list[step,:] = rewards
+        
+        reward_list_base[step,:] = rewards.copy()
+        
+        if reward_clipping is not None:
+            rewards = np.clip(rewards, reward_clipping[0], reward_clipping[1])
+        
+        if reward_scale is not None:
+            reward_list[step,:] = reward_scale(rewards)
+        else:
+            reward_list[step,:] = rewards
         last_observations = model_policy.flatten_observation(observations)
         final_idx = np.nonzero(final)[0]
         
@@ -164,14 +247,16 @@ def sync_agents(model_policy, model_Vn, envs, max_length, lam, discount, last_ob
                 new_advantages_list.append(new_advantages)
             
             # Update the final lengths and rewards, and reset the temporary counters
-            lengths_final[agent_idx] = sum(num_idx) + temp_lengths[agent_idx]
-            rewards_final[agent_idx] = sum(reward_list[num_idx,agent_idx]) + temp_rewards[agent_idx]            
+            cum_lengths[agent_idx] += sum(num_idx) + temp_lengths[agent_idx]
+            cum_rewards[agent_idx] += sum(reward_list_base[num_idx,agent_idx]) + temp_rewards[agent_idx]     
+                
             temp_lengths[agent_idx] = 0
             temp_rewards[agent_idx] = 0
             games[agent_idx] += 1
             observation_list[:,agent_idx,:] = np.nan
             action_list[:,agent_idx] = np.nan
             reward_list[:,agent_idx] = np.nan
+            reward_list_base[:,agent_idx] = np.nan
             
         step +=1
     
@@ -195,15 +280,19 @@ def sync_agents(model_policy, model_Vn, envs, max_length, lam, discount, last_ob
         temp_rewards[agent_idx] += sum(reward_list[num_idx,agent_idx])
     
     # Concatenate and return the collected data
-    return torch.cat(discount_rewards_list, dim=0), torch.cat(new_observations_list, dim=0), torch.cat(new_actions_list, dim=0), torch.cat(new_advantages_list, dim=0), lengths_final, rewards_final, temp_lengths, temp_rewards, games, last_observations
+    return torch.cat(discount_rewards_list, dim=0), torch.cat(new_observations_list, dim=0), torch.cat(new_actions_list, dim=0), torch.cat(new_advantages_list, dim=0), temp_lengths, temp_rewards, cum_lengths, cum_rewards, games, last_observations
         
 
 def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsilon,
-          n_cycles, n_epochs, batch_size, n_agents=1, max_length=64, asynchronous=False,
+          n_cycles, n_epochs, batch_size, n_agents=1, max_length=64, asynchronous=False, reset_cycle=True,
           report_updates=None, gradient_clip_policy=None, gradient_clip_Vn=None, median_stop_threshold=None,
-          median_stop_patience=None, length=False, save_cycles=None, 
+          median_stop_patience=None, length=False, save_cycles=None, value_clipping=None, 
+          reward_scale_discount=None, reward_clipping=None,
           policy_lr=0.001, policy_beta1=0.9, policy_beta2=0.999, policy_eps=1e-08, 
-          Vn_lr=0.001, Vn_beta1=0.9, Vn_beta2=0.999, Vn_eps=1e-08, device='cpu', inference_device='cpu'):
+          policy_lr_end=None, policy_lr_cycles=None, 
+          Vn_lr=0.001, Vn_beta1=0.9, Vn_beta2=0.999, Vn_eps=1e-08,
+          Vn_lr_end=None, Vn_lr_cycles=None, 
+          device='cpu', inference_device='cpu'):
     """
     Trains policy and value network models using Proximal Policy Optimization (PPO).
 
@@ -222,6 +311,7 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
     n_agents (int): Number of agents in the environment.
     max_length (int): Maximum length of an episode.
     asynchronous (bool): Flag for asynchronous environment execution.
+    reset_cycle (bool): Flag that enables resetting the environment each cycle
     report_updates (int): Frequency of reporting training progress.
     gradient_clip_policy (float): Gradient clipping value for policy model.
     gradient_clip_Vn (float): Gradient clipping value for value network.
@@ -229,11 +319,18 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
     median_stop_patience (int): Number of cycles to wait for early stopping (the threshold nneds to be beaten for the length of the patience period).
     length (bool): Flag to use length instead of reward for reporting and stopping.
     save_cycles (int): Frequency of saving model states and statistics.
+    value_clipping (float/tuple): epsilon to enable value clipping.
+    reward_scale_discount (float): discount used for reward scaling
+    reward_clipping (float/tuple): clip values to enable reward clipping.
     policy_lr (float): Learning rate for the policy optimizer.
+    policy_lr_end (float): Final learning rate for the policy optimizer when using linear annealing.
+    policy_lr_cycles (int): The cycles where the learning rate will be reduced (set to None if you dont want learning rate annealing).
     policy_beta1 (float): Beta1 for the policy optimizer.
     policy_beta2 (float): Beta2 for the policy optimizer.
     policy_eps (float): Epsilon for the policy optimizer.
     Vn_lr (float): Learning rate for the value network optimizer.
+    Vn_lr_end (float): Final learning rate for the value network optimizer when using linear annealing.
+    Vn_lr_cycles (int): The cycles where the learning rate will be reduced (set to None if you dont want learning rate annealing).
     Vn_beta1 (float): Beta1 for the value network optimizer.
     Vn_beta2 (float): Beta2 for the value network optimizer.
     Vn_eps (float): Epsilon for the value network optimizer.
@@ -248,10 +345,9 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
     reward_sum = np.zeros((n_cycles, n_agents))
     reward_len = np.zeros((n_cycles, n_agents))
     games_played = np.zeros((n_cycles, n_agents))
+    learning_rate = np.zeros((n_cycles, 2))
     
     # Temporary storage for ongoing episode data
-    rewards = np.zeros((n_agents))
-    lengths = np.zeros((n_agents))
     games = np.zeros((n_agents))
     temp_rewards = np.zeros((n_agents))
     temp_lengths = np.zeros((n_agents))
@@ -259,6 +355,14 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
     # Setting up optimizers for the policy and value networks
     optimizer_policy = torch.optim.Adam(model_policy.parameters(), lr=policy_lr, betas=(policy_beta1, policy_beta2), eps=policy_eps)
     optimizer_Vn = torch.optim.Adam(model_Vn.parameters(), lr=Vn_lr, betas=(Vn_beta1, Vn_beta2), eps=Vn_eps)
+    
+    # Learning rate scheduler
+    if policy_lr_cycles is not None:
+        factor_policy = (policy_lr_end/policy_lr)
+        scheduler_policy = torch.optim.lr_scheduler.LinearLR(optimizer_policy, start_factor=1.0, end_factor=factor_policy, total_iters=policy_lr_cycles, last_epoch=-1, verbose=False)
+    if Vn_lr_cycles is not None:
+        factor_Vn = (Vn_lr_end/Vn_lr)
+        scheduler_Vn = torch.optim.lr_scheduler.LinearLR(optimizer_Vn, start_factor=1.0, end_factor=factor_Vn, total_iters=Vn_lr_cycles, last_epoch=-1, verbose=False)
     
     # Transfer models to the inference device
     model_policy, model_Vn = model_policy.to(inference_device), model_Vn.to(inference_device)
@@ -276,14 +380,22 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
     last_observations, _ = envs.reset()
     last_observations = model_policy.flatten_observation(last_observations)
     
+    # Create reward scaling instance
+    reward_scale = None
+    if reward_scale_discount is not None:
+        reward_scale_class = RewardScale(reward_scale_discount)
+        reward_scale = np.vectorize(reward_scale_class.__call__)    
+    
     for cycle in range(n_cycles):  
         # Synchronize agents and gather training data
-        discount_rewards, observations, actions, advantages, lengths, rewards, temp_lengths, temp_rewards, games, last_observations = sync_agents(model_policy, model_Vn, envs, max_length, lam, discount, last_observations, lengths, rewards, temp_lengths, temp_rewards, games, flattened_observation_space, flattened_action_space, inference_device)
+        discount_rewards, observations, actions, advantages, temp_lengths, temp_rewards, cum_lengths, cum_rewards, games, last_observations = sync_agents(model_policy, model_Vn, envs, max_length, lam, discount, last_observations, temp_lengths, temp_rewards, games, flattened_observation_space, flattened_action_space, reward_scale, reward_clipping, inference_device)
         
-        # Update rewards, lengths, and games played
-        reward_sum[cycle,:] = rewards
-        reward_len[cycle,:] = lengths        
-        games_played[cycle,:] = games.copy()
+        # Update rewards, lengths, and games played        
+        cum_games = np.where(games>0, games, 1)        
+        reward_sum[cycle,:] = np.where(games>0, cum_rewards/cum_games, reward_sum[max(0, cycle-1),:])
+        reward_len[cycle,:] = np.where(games>0, cum_lengths/cum_games, reward_len[max(0, cycle-1),:])   
+        games_played[cycle,:] = games_played[max(0, cycle-1),:] + games.copy()        
+        games = np.zeros((n_agents))
         
         # Transfer models to the training device if different from the inference device
         if inference_device != device:
@@ -293,7 +405,8 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
         batch_num = 1
         if len(observations) > batch_size:
             batch_num = int(len(observations)/batch_size)        
-        model_old = copy.deepcopy(model_policy)
+        model_policy_old = copy.deepcopy(model_policy)
+        model_Vn_old = copy.deepcopy(model_Vn)
         
         for epoch in range(n_epochs):
             # Shuffle the observations and process each batch
@@ -304,7 +417,7 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
                 # Zero gradients
                 optimizer_policy.zero_grad()    
                 # Compute and backpropagate the policy loss                
-                loss_policy = loss_fn(model_policy, model_old, observations[current_idx].to(device), actions[current_idx].to(device), advantages[current_idx].to(device), beta, epsilon)    
+                loss_policy = loss_fn_policy(model_policy, model_policy_old, observations[current_idx].to(device), actions[current_idx].to(device), advantages[current_idx].to(device), beta, epsilon)    
                 loss_policy.backward()
                 if gradient_clip_policy is not None:
                     nn.utils.clip_grad_norm_(model_policy.parameters(), gradient_clip_policy)
@@ -314,12 +427,23 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
                 # Zero gradients for both models
                 optimizer_Vn.zero_grad()
                 # Compute and backpropagate the value network loss
-                Vn = torch.squeeze(model_Vn(observations[current_idx].to(device)))
-                loss_Vn = nn.MSELoss()(Vn, discount_rewards[current_idx].to(device))
+                if value_clipping is not None:
+                    loss_Vn = loss_fn_Vn(model_Vn, model_Vn_old, observations[current_idx].to(device), discount_rewards[current_idx].to(device), value_clipping)
+                else:
+                    Vn = torch.squeeze(model_Vn(observations[current_idx].to(device)))
+                    loss_Vn = nn.functional.mse_loss(Vn, discount_rewards[current_idx].to(device))
                 loss_Vn.backward()
                 if gradient_clip_Vn is not None:
                     nn.utils.clip_grad_norm_(model_Vn.parameters(), gradient_clip_Vn)
                 optimizer_Vn.step()
+        
+        # Reset the environments if needed
+        if reset_cycle:
+            temp_rewards = np.zeros((n_agents))
+            temp_lengths = np.zeros((n_agents))
+            envs = gym.vector.make(env_name, num_envs=n_agents, asynchronous=asynchronous)
+            last_observations, _ = envs.reset()
+            last_observations = model_policy.flatten_observation(last_observations)
         
         # Transfer models back to the inference device if necessary
         if inference_device != device:
@@ -338,6 +462,14 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
                 q3_reward = np.quantile(reward_sum[cycle,:], 0.75)
                 print("cycle: " + str(cycle) + ' reward: ' + str(median_reward) + " - q1:"+str(q1_reward)+ " - q3:"+str(q3_reward))
         
+        # Scheduler updates
+        learning_rate[cycle,0] = optimizer_policy.param_groups[-1]['lr']
+        learning_rate[cycle,1] = optimizer_Vn.param_groups[-1]['lr']
+        if policy_lr_cycles is not None:
+            scheduler_policy.step()
+        if Vn_lr_cycles is not None:
+            scheduler_Vn.step()
+        
         # Early stopping
         if median_stop_threshold is not None and median_stop_patience is not None and cycle >= median_stop_patience:
             if length:
@@ -354,7 +486,9 @@ def train(model_policy, model_Vn, save_name, env_name, lam, discount, beta, epsi
             np.savetxt(save_name + "_episoderewards.csv", reward_sum[:cycle+1,:], delimiter=',')
             np.savetxt(save_name + "_episodelength.csv", reward_len[:cycle+1,:], delimiter=',')
             np.savetxt(save_name + "_gamesplayed.csv", games_played[:cycle+1,:], delimiter=',')
-    return reward_sum[:cycle+1,:], reward_len[:cycle+1,:]
+            np.savetxt(save_name + "_learningrate.csv", learning_rate[:cycle+1,:], delimiter=',')
+        
+    return reward_sum[:cycle+1,:], reward_len[:cycle+1,:], games_played[:cycle+1,:], learning_rate[:cycle+1,:]
 
 if __name__ == "__main__":
     # Importing necessary models and argparse for command-line argument parsing
@@ -375,31 +509,43 @@ if __name__ == "__main__":
     
     # Processing the settings to ensure correct data types
     for key, value in settings.items():
+        
         # Handling empty or 'None' string values
         if isinstance(value, str):
             if value.lower() in ['', 'none', 'na', 'nan']:
                 settings[key] = None
+                continue
         elif pd.isna(value):
             settings[key] = None
+            continue
+        
+        # Handle tuples or lists
+        if key in ["value_clipping", "reward_clipping"]:
+            if value[0] == '[' or value[0] == '(':
+                temp_val = value[1:-1].split(',')
+                settings[key] = [float(i) for i in temp_val]
+                continue
         
         # Converting settings to appropriate data types
-        if not key in ["env_name", "device", "inference_device"] and value is not None:
-            if key in ["n_cycles", "report_updates", "median_stop_patience", "n_agents", "n_epochs", "batch_size", "max_length", "save_cycles"]:
+        if not key in ["env_name", "device", "inference_device"]:
+            if key in ["n_cycles", "report_updates", "median_stop_patience", "n_agents", "n_epochs", "batch_size", "max_length", "save_cycles", "policy_lr_cycles", "Vn_lr_cycles"]:
                 settings[key] = int(value)
-            elif key in ["length", "asynchronous"]:
+            elif key in ["length", "asynchronous", "reset_cycle"]:
                 settings[key] = (value.lower()=="true")
             else:
                 settings[key] = float(value)
-    
+
     # Loading the models for training    
     model_policy = current_policy
     model_Vn = current_Vn
     
     # Training the models with the specified settings
-    reward_sum, reward_len = train(model_policy, model_Vn, args.exp_name, **settings)
+    reward_sum, reward_len, games_played, learning_rate = train(model_policy, model_Vn, args.exp_name, **settings)
     
     # Saving the training results and model states
     np.savetxt(args.exp_name + "_episoderewards.csv", reward_sum, delimiter=',')
-    np.savetxt(args.exp_name + "_episodelength.csv", reward_len, delimiter=',')    
+    np.savetxt(args.exp_name + "_episodelength.csv", reward_len, delimiter=',')   
+    np.savetxt(args.exp_name + "_gamesplayed.csv", games_played, delimiter=',')    
+    np.savetxt(args.exp_name + "_learningrate.csv", learning_rate, delimiter=',')
     torch.save(model_policy.state_dict(), args.exp_name + "_policy.pt")
     torch.save(model_Vn.state_dict(), args.exp_name + "_Vn.pt")
