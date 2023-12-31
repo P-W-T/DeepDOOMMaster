@@ -522,7 +522,7 @@ if __name__ == "__main__":
         # Handle tuples or lists
         if key in ["value_clipping", "reward_clipping"]:
             if value[0] == '[' or value[0] == '(':
-                temp_val = value[1:-1].split(',')
+                temp_val = value[1:-1].split(';') #when writing lists for this value, use ; as separator
                 settings[key] = [float(i) for i in temp_val]
                 continue
         
